@@ -1,0 +1,191 @@
+name: libmpv-d3d11-gpu-next
+
+# 目的：在 cohikta/mpv（已打 gpu-next + D3D11 render backend 补丁）上，
+# 产出与 guoapp 的 packages/media_kit_libs_windows_video 完全同构的
+# mpv-dev-x86_64-*.7z（libmpv-2.dll 静态链接、libmpv.dll.a、include/mpv/*.h）。
+#
+# 复用上游 ci/build-mingw64-full.sh：它用 --prefer-static 把所有依赖静态链进
+# libmpv-2.dll，所以宿主 CMake 只需 bundled 这一个 DLL，与原发布包一致。
+
+on:
+  workflow_dispatch:
+    inputs:
+      libplacebo_source:
+        description: 'libplacebo 来源：auto=探测容器自带是否带 D3D11；yes=强制源码构建；no=只用容器自带'
+        type: choice
+        options: [auto, yes, no]
+        default: auto
+      allow_warnings:
+        description: '去掉 --werror（PR #16818 骨架是 Draft，可能有告警）'
+        type: boolean
+        default: true
+      publish_to_guoapp:
+        description: '把 7z 上传到 Xanerix/guoapp 的 windows-native-deps Release（需 secret GUOAPP_RELEASE_TOKEN）'
+        type: boolean
+        default: false
+  push:
+    branches: [master]
+    paths:
+      - 'meson.build'
+      - 'include/mpv/**'
+      - 'video/out/**'
+      - 'ci/build-mingw64-full.sh'
+      - '.github/workflows/libmpv-static-gpu-next.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build static libmpv (win64 / GPL)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ffmpeg-builds/ffmpeg-builds/win64-gpl:latest
+      env:
+        WINEPREFIX: /tmp/wine
+    env:
+      LIBPLACEBO_SOURCE: ${{ inputs.libplacebo_source || 'auto' }}
+      # libplacebo >= 7.387.0 且带 D3D11；若 tag 不存在改成 master 或实际 tag
+      LIBPLACEBO_REF: v7.387.0
+      ALLOW_WARNINGS: ${{ inputs.allow_warnings != false }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Show patch state
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory /__w/mpv/mpv
+          git log -3 --oneline
+          echo '--- render.h ---'
+          grep -n 'MPV_RENDER_PARAM_BACKEND\|MPV_RENDER_PARAM_D3D11_FBO' include/mpv/render.h
+          echo '--- meson.build (gpu_next sources) ---'
+          grep -n 'gpu_next/' meson.build
+          echo '--- vo_libmpv.c backend selection ---'
+          grep -n 'MPV_RENDER_PARAM_BACKEND\|gpu_next_backends' video/out/vo_libmpv.c
+
+      - name: "Optional: drop --werror"
+        # ci/build-common.sh 里 common_args="--werror \..."；PR 草稿代码可能带告警。
+        # 生产构建建议把告警修掉后关掉这个开关。
+        if: ${{ env.ALLOW_WARNINGS == 'true' }}
+        run: |
+          sed -i 's/--werror[[:space:]]*//' ci/build-common.sh
+          head -5 ci/build-common.sh
+
+      - name: Probe container libplacebo
+        id: probe
+        run: |
+          echo "pkg-config version : $(pkg-config --modversion libplacebo 2>/dev/null || echo N/A)"
+          echo "FFBUILD_PREFIX     : $FFBUILD_PREFIX"
+          find "$FFBUILD_PREFIX/include" -name 'config.h' -path '*libplacebo*' \
+               -exec grep -H 'PL_HAVE_D3D11\|PL_API_VER' {} \; 2>/dev/null || true
+
+      - name: Build libmpv (static, D3D11 + gpu-next)
+        id: build
+        run: ./ci/build-mingw64-full.sh
+
+      - name: Print meson log
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: cat ./build/meson-logs/meson-log.txt
+
+      - name: Verify D3D11 / gpu-next / exports
+        run: |
+          set -e
+          echo '--- artifact-libmpv ---'
+          ls -l artifact-libmpv/ artifact-libmpv/include/mpv/
+          echo '--- patched render.h shipped? ---'
+          grep -q 'MPV_RENDER_PARAM_BACKEND' artifact-libmpv/include/mpv/render.h
+          echo '--- D3D11 render API symbols exported? ---'
+          "${FFBUILD_CROSS_PREFIX}objdump" -p artifact-libmpv/libmpv-2.dll \
+            | grep -i 'mpv_render_context_create\|mpv_render_context_render'
+          echo '--- gpu-next objects linked? ---'
+          find build -name '*libmpv_gpu_next*d3d11*.o' -o -name '*libmpv_gpu_next*.o' | head -20
+          echo '--- libplacebo D3D11 support ---'
+          find "$FFBUILD_PREFIX/include" -name 'config.h' -path '*libplacebo*' \
+               -exec grep -H 'PL_HAVE_D3D11' {} \; || echo 'WARN: PL_HAVE_D3D11 not found'
+
+      - name: Write build info
+        run: |
+          {
+            echo "mpv commit      : $(git rev-parse HEAD)"
+            echo "mpv subject     : $(git log -1 --format=%s)"
+            echo "workflow run    : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "libplacebo      : $(pkg-config --modversion libplacebo 2>/dev/null || echo unknown)"
+            echo "LIBPLACEBO_SOURCE: $LIBPLACEBO_SOURCE"
+            echo "ALLOW_WARNINGS  : $ALLOW_WARNINGS"
+          } > artifact-libmpv/BUILD_INFO.txt
+          meson configure build 2>/dev/null | grep -E '^\s*(d3d11|libmpv|libplacebo|cplayer)\s' \
+            >> artifact-libmpv/BUILD_INFO.txt || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libmpv-raw-${{ github.sha }}
+          path: artifact-libmpv/*
+          retention-days: 7
+
+  package:
+    name: Pack 7z + sha256
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      archive: ${{ steps.pack.outputs.name }}
+      sha256: ${{ steps.pack.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: libmpv-raw-${{ github.sha }}
+          path: payload
+
+      - name: Make 7z and compute sha256
+        id: pack
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+          name="mpv-dev-x86_64-${{ github.sha }}.7z"
+          (cd payload && 7z a -mx=9 "../$name" .)
+          sha=$(sha256sum "$name" | cut -d' ' -f1)
+          echo "name=$name"  >> "$GITHUB_OUTPUT"
+          echo "sha=$sha"    >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c%s "$name")" >> "$GITHUB_OUTPUT"
+          echo "archive=$name  sha256=$sha  bytes=$(stat -c%s "$name")"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: libmpv-d3d11-gpu-next-${{ github.sha }}
+          path: |
+            ${{ steps.pack.outputs.name }}
+          retention-days: 30
+
+      - name: Print the exact CMake snippet for guoapp
+        run: |
+          cat <<EOF
+          # packages/media_kit_libs_windows_video/windows/CMakeLists.txt
+          duanju_native_archive(
+            "${{ steps.pack.outputs.name }}"
+            "https://github.com/Xanerix/guoapp/releases/download/windows-native-deps/${{ steps.pack.outputs.name }}"
+            "${{ steps.pack.outputs.sha }}"
+            "\${LIBMPV_SRC}"
+            "libmpv-2.dll" "libmpv.dll.a" "include/mpv/client.h" "include/mpv/render.h"
+          )
+          EOF
+
+  publish:
+    name: Upload 7z to guoapp Release (optional)
+    needs: package
+    if: ${{ inputs.publish_to_guoapp == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: libmpv-d3d11-gpu-next-${{ github.sha }}
+      - name: Upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GUOAPP_RELEASE_TOKEN }}
+        run: |
+          gh release upload windows-native-deps \
+            "${{ needs.package.outputs.archive }}" \
+            --repo Xanerix/guoapp --clobber
+          echo "sha256=${{ needs.package.outputs.sha256 }}"

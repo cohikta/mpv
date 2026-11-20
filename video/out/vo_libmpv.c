@@ -111,8 +111,19 @@ struct mpv_render_context {
     struct mp_vo_opts *vo_opts;
 };
 
+// The libplacebo based render backend lives in
+// video/out/gpu_next/libmpv_gpu_next.c. Declared here instead of libmpv.h so
+// that a build without the gpu-next sources still links.
+extern const struct render_backend_fns render_backend_gpu_next;
+
 const struct render_backend_fns *render_backends[] = {
     &render_backend_gpu,
+    &render_backend_sw,
+    NULL
+};
+
+static const struct render_backend_fns *gpu_next_backends[] = {
+    &render_backend_gpu_next,
     &render_backend_sw,
     NULL
 };
@@ -184,13 +195,25 @@ int mpv_render_context_create(mpv_render_context **res, mpv_handle *mpv,
     if (GET_MPV_RENDER_PARAM(params, MPV_RENDER_PARAM_ADVANCED_CONTROL, int, 0))
         ctx->advanced_control = true;
 
+    // Select the render backend. MPV_RENDER_PARAM_BACKEND is a plain string;
+    // unpatched hosts simply omit it and keep the legacy behaviour.
+    const char *backend_name =
+        get_mpv_render_param(params, MPV_RENDER_PARAM_BACKEND, NULL);
+    const struct render_backend_fns **backends = render_backends;
+    if (backend_name && strcmp(backend_name, "gpu-next") == 0) {
+        MP_VERBOSE(ctx, "Using gpu-next render backend.\n");
+        backends = gpu_next_backends;
+    } else {
+        MP_VERBOSE(ctx, "Using default gpu render backend.\n");
+    }
+
     int err = MPV_ERROR_NOT_IMPLEMENTED;
-    for (int n = 0; render_backends[n]; n++) {
+    for (int n = 0; backends[n]; n++) {
         ctx->renderer = talloc_zero(NULL, struct render_backend);
         *ctx->renderer = (struct render_backend){
             .global = ctx->global,
             .log = ctx->log,
-            .fns = render_backends[n],
+            .fns = backends[n],
         };
         err = ctx->renderer->fns->init(ctx->renderer, params);
         if (err >= 0)

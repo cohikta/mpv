@@ -435,6 +435,24 @@ typedef enum mpv_render_param_type {
      * Type: mpv_d3d11_fbo*
      */
     MPV_RENDER_PARAM_D3D11_FBO = 22,
+    /**
+     * The name of the render backend to use. Valid for mpv_render_context_create().
+     *
+     * Type: char* (a 0-terminated string, not a pointer to a char).
+     *
+     * Defined backends:
+     *   "gpu"      (default) - legacy gl_video renderer
+     *   "gpu-next"           - libplacebo based renderer
+     *
+     * If this parameter is absent, or its value is not recognized, the default
+     * "gpu" backend is used. This keeps all pre-existing API users unchanged.
+     * An unknown value is ignored rather than rejected, so hosts can probe for
+     * the presence of this feature without a version check.
+     *
+     * Note: 23 is used (not 21 as in the original PR draft) because 0.42
+     * already occupies 21/22 with the D3D11 render API parameters.
+     */
+    MPV_RENDER_PARAM_BACKEND = 23,
 } mpv_render_param_type;
 
 /**

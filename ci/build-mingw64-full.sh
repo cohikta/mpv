@@ -24,6 +24,9 @@ CXXFLAGS="${CXXFLAGS/-I${FFBUILD_PREFIX}\/include/-isystem${FFBUILD_PREFIX}/incl
 
 gpl=false
 [[ $VARIANT == gpl* ]] && gpl=true
+# Pin a libplacebo with D3D11 support (mpv 0.42 requires >= 7.387.0).
+# Override from the workflow with env LIBPLACEBO_REF=vX.Y.Z or master.
+LIBPLACEBO_REF="${LIBPLACEBO_REF:-v7.387.0}"
 
 gitclone="git clone --depth=1 --recursive --shallow-submodules"
 group() { echo "::group::$1"; }
@@ -97,6 +100,47 @@ group "Building subrandr"
 build_subrandr "$FFBUILD_PREFIX" --target "$FFBUILD_RUST_TARGET" \
                --static-library true --shared-library false
 endgroup
+
+# --- guoapp / gpu-next D3D11 -------------------------------------------
+# The libmpv gpu-next D3D11 render backend needs libplacebo >= 7.387.0 with
+# PL_HAVE_D3D11 (pl_d3d11_create / pl_d3d11_wrap). The FFmpeg-Builds image
+# ships a static libplacebo, but its version / D3D11 support is not guaranteed.
+# Probe it and, when needed, build our own static one into $FFBUILD_PREFIX so
+# that mpv's `--prefer-static` links against it.
+#
+# LIBPLACEBO_SOURCE=yes    always build from source
+# LIBPLACEBO_SOURCE=no     always use the image's copy
+# LIBPLACEBO_SOURCE=auto   probe, build only when D3D11 is missing (default)
+group "libplacebo / D3D11 probe"
+libplacebo_source="${LIBPLACEBO_SOURCE:-auto}"
+libplacebo_ok=false
+pl_cfg=$(find "$FFBUILD_PREFIX/include" -path '*libplacebo*' -name config.h \
+              -print -quit 2>/dev/null || true)
+if [[ -n "$pl_cfg" ]] && grep -q 'PL_HAVE_D3D11' "$pl_cfg"; then
+    libplacebo_ok=true
+    echo "container libplacebo ($(pkg-config --modversion libplacebo 2>/dev/null || echo '?')) has D3D11"
+else
+    echo "container libplacebo has NO PL_HAVE_D3D11 (cfg: ${pl_cfg:-none})"
+fi
+if [[ "$libplacebo_source" == no ]]; then
+    echo "LIBPLACEBO_SOURCE=no: using container libplacebo as-is"
+elif [[ "$libplacebo_source" == yes ]] || { [[ "$libplacebo_source" == auto ]] && ! $libplacebo_ok; }; then
+    echo "Building libplacebo ${LIBPLACEBO_REF} with -Dd3d11=enabled"
+    $gitclone -b "${LIBPLACEBO_REF}" https://code.videolan.org/videolan/libplacebo.git libplacebo-src
+    pushd libplacebo-src
+    meson setup build --cross-file /cross.meson \
+        --prefix "$FFBUILD_PREFIX" --libdir "$FFBUILD_PREFIX/lib" \
+        --default-library=static --buildtype=release \
+        -Ddemos=false -Dtests=false -D{opengl,d3d11,lcms}=enabled
+    ninja -C build
+    ninja -C build install
+    popd
+    pl_cfg=$(find "$FFBUILD_PREFIX/include" -path '*libplacebo*' -name config.h -print -quit || true)
+    grep -q 'PL_HAVE_D3D11' "$pl_cfg" || {
+        echo "ERROR: libplacebo built without PL_HAVE_D3D11"; exit 1; }
+fi
+endgroup
+# -----------------------------------------------------------------------
 
 group "Building cppwinrt"
 # win32-smtc needs the C++/WinRT projection headers, generated from the
