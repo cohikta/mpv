@@ -16,7 +16,7 @@ on:
         options: [auto, yes, no]
         default: auto
       allow_warnings:
-        description: '去掉 --werror（PR #16818 骨架是 Draft，可能有告警）'
+        description: '去掉 --werror（仅对普通告警有效；API 不匹配导致的 implicit declaration 无法靠它绕过）'
         type: boolean
         default: true
       publish_to_guoapp:
@@ -56,8 +56,6 @@ jobs:
 
       - name: Show patch state
         run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config --global --add safe.directory /__w/mpv/mpv
           git log -3 --oneline
           echo '--- render.h ---'
           grep -n 'MPV_RENDER_PARAM_BACKEND\|MPV_RENDER_PARAM_D3D11_FBO' include/mpv/render.h
@@ -65,6 +63,26 @@ jobs:
           grep -n 'gpu_next/' meson.build
           echo '--- vo_libmpv.c backend selection ---'
           grep -n 'MPV_RENDER_PARAM_BACKEND\|gpu_next_backends' video/out/vo_libmpv.c
+
+      - name: Preflight - reject mixed gpu_next API
+        # 0.42 的 vo=gpu-next 驱动用自己的渲染逻辑，不引用 mppl_video_*。
+        # 若出现 mppl_video_*，说明混入了新版 master 的精简 VO，而本树是
+        # PR #16818 的 pl_video_* 引擎，二者不兼容。
+        run: |
+          set -e
+          if grep -q 'mppl_video_' video/out/vo_gpu_next.c; then
+            echo "::error::vo_gpu_next.c references mppl_video_* (post-0.42 API)."
+            echo "::error::Apply patches/restore-vo-gpu-next.patch to restore the 0.42 VO driver."
+            exit 1
+          fi
+          grep -q 'pl_video_init' video/out/gpu_next/video.h
+          grep -q 'libmpv_gpu_next_context_d3d11' video/out/gpu_next/libmpv_gpu_next.h
+          n=$(grep -c "'video/out/gpu_next/video.c'" meson.build)
+          if [ "$n" -ne 1 ]; then
+            echo "::error::meson.build lists gpu_next/video.c $n times (expected 1)"
+            exit 1
+          fi
+          echo "preflight OK: 0.42 VO + PR pl_video_* engine + D3D11 backend aligned"
 
       - name: "Optional: drop --werror"
         # ci/build-common.sh 里 common_args="--werror \..."；PR 草稿代码可能带告警。
